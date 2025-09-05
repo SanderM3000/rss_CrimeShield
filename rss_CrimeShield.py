@@ -272,7 +272,7 @@ def load_feeds() -> List[str]:
         return DEFAULT_FEEDS[:]
 
 def save_feeds(feeds: List[str]):
-    FEEDS_JSON.write_text(json.dumps(feeds, ensure_ascii=False, indent=2), encoding="utf-8")
+    FEEDS_JSON.write_text(json.dumps(feeds, ensure_ascii=False, indent=2))
 
 def seems_like_feed_url(u: str) -> bool:
     """Heuristic: accept URLs that look like RSS/Atom feed endpoints."""
@@ -296,6 +296,8 @@ def fetch_feed_rows(feed_url: str) -> pd.DataFrame:
         description = getattr(e, "summary", None) or getattr(e, "description", None)
         image_url = first_media_url(e)
 
+        # NOTE: filtering based on words has been intentionally removed.
+
         rows.append({
             "article_id": gen_article_id(url),
             "title": s(title),
@@ -308,6 +310,7 @@ def fetch_feed_rows(feed_url: str) -> pd.DataFrame:
             "source_feed_url": s(feed_url),
             "fetched_at_utc": fetched_at,
         })
+
     return dedupe_df(pd.DataFrame(rows, dtype=str))
 
 def fetch_all_feeds(feed_urls: List[str]) -> pd.DataFrame:
@@ -438,6 +441,7 @@ class VrtDesktopApp(tk.Tk):
         # UI
         self.create_widgets()
         self.populate_table(self.current_df)
+        self.bind("<Control-u>", lambda e: self.upsert_selected())
 
         # Loops
         self.after(1000, self.tick_countdown)             # 1s countdown
@@ -452,6 +456,8 @@ class VrtDesktopApp(tk.Tk):
         self.status_var = tk.StringVar(value=self.status_line())
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT)
 
+        ttk.Button(top, text="Upsert selected", command=self.upsert_selected).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(top, text="Upsert all listed", command=self.upsert_all_listed).pack(side=tk.RIGHT, padx=6)
         ttk.Button(top, text="Refresh now", command=self.poll_now).pack(side=tk.RIGHT, padx=6)
         ttk.Button(top, text="Export to Excel", command=self.export_excel).pack(side=tk.RIGHT, padx=6)
 
@@ -465,7 +471,7 @@ class VrtDesktopApp(tk.Tk):
             left_frame,
             columns=("when", "title", "author", "source"),
             show="headings",
-            selectmode="browse",
+            selectmode="extended",
             height=25
         )
         self.tree.heading("when", text="Published (UTC)")
@@ -716,6 +722,53 @@ class VrtDesktopApp(tk.Tk):
                                    f"Excel file was locked. Wrote fallback:\n{alt.resolve()}")
         except Exception as e:
             messagebox.showerror("Export", f"Failed to export Excel:\n{e}")
+
+    # -------- Manual upsert actions --------
+    def get_selection_ids(self) -> List[str]:
+        """Return article_ids for the currently selected rows (supports multi-select)."""
+        sel_iids = list(self.tree.selection())
+        ids: List[str] = []
+        for iid in sel_iids:
+            aid = self.iid_to_article_id.get(iid, iid)
+            if aid:
+                ids.append(aid)
+        # De-dup, preserve order
+        seen = set()
+        uniq = []
+        for a in ids:
+            if a not in seen:
+                seen.add(a); uniq.append(a)
+        return uniq
+
+    def upsert_dataframe(self, df: pd.DataFrame, label: str):
+        """Common helper to upsert a DataFrame and report status."""
+        df = dedupe_df(df)
+        if df.empty:
+            messagebox.showinfo("Upsert", f"No rows to upsert for: {label}")
+            return
+        try:
+            written = upsert_articles(df)
+            self.status_var.set(self.status_line() + f"  |  [DB] Upserted {written} row(s) ({label}).")
+            messagebox.showinfo("Upsert", f"Upserted {written} row(s) to database.\n\n{label}")
+        except Exception as db_err:
+            msg = f"DB upsert error: {type(db_err).__name__}: {db_err}"
+            self.status_var.set(msg)
+            messagebox.showerror("Upsert failed", msg)
+
+    def upsert_selected(self):
+        """Upsert only the selected rows in the table."""
+        sel_ids = self.get_selection_ids()
+        if not sel_ids:
+            messagebox.showinfo("Upsert selected", "Select one or more rows first.")
+            return
+        # Build subset DataFrame by article_id
+        df = self.current_df[self.current_df["article_id"].isin(sel_ids)].copy()
+        self.upsert_dataframe(df, label=f"Selected {len(sel_ids)} article(s)")
+
+    def upsert_all_listed(self):
+        """Upsert all rows currently listed in the table (what you see after filters/merge)."""
+        self.upsert_dataframe(self.current_df.copy(), label="All listed articles")
+
 
     # -------- Manage sources --------
     def add_feed(self):
